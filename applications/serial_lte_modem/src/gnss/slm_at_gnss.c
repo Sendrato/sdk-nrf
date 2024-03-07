@@ -9,6 +9,7 @@
 #include <zephyr/logging/log.h>
 #include <date_time.h>
 #include <nrf_modem_gnss.h>
+#include "../slm_uart_handler.h"
 
 #if defined(CONFIG_SLM_NRF_CLOUD)
 #include <net/nrf_cloud.h>
@@ -77,6 +78,17 @@ static enum gnss_status {
 static struct k_work gnss_status_notifier;
 /* FIFO to pass the GNSS statuses to the notifier worker. */
 K_FIFO_DEFINE(gnss_status_fifo);
+
+/* Worker and queue to send NMEA and PVT messages to host */
+#if defined(CONFIG_SLM_LOG_NMEA) || defined(CONFIG_SLM_LOG_PVT)
+struct k_work log_work;
+#endif /* CONFIG_SLM_LOG_NMEA || CONFIG_SLM_LOG_PVT */
+#if defined(CONFIG_SLM_LOG_NMEA)
+K_MSGQ_DEFINE(log_queue_nmea, sizeof(struct nrf_modem_gnss_nmea_data_frame), 4, 4);
+#endif /* CONFIG_SLM_LOG_NMEA */
+#if defined(CONFIG_SLM_LOG_PVT)
+K_MSGQ_DEFINE(log_queue_pvt, sizeof(struct nrf_modem_gnss_pvt_data_frame), 4, 4);
+#endif /* CONFIG_SLM_LOG_PVT */
 
 /* Whether to use the nRF Cloud assistive services that were compiled in (A-GNSS/P-GPS).
  * If enabled, the connection to nRF Cloud is required during GNSS startup
@@ -237,14 +249,10 @@ static int gnss_startup(void)
 #endif /* CONFIG_SLM_NRF_CLOUD */
 
 
-#if defined(CONFIG_SLM_LOG_LEVEL_DBG)
+#if defined(CONFIG_SLM_LOG_NMEA)
 	/* Subscribe to NMEA messages for debugging fix acquisition. */
 	nrf_modem_gnss_qzss_nmea_mode_set(NRF_MODEM_GNSS_QZSS_NMEA_MODE_CUSTOM);
-	ret = nrf_modem_gnss_nmea_mask_set(NRF_MODEM_GNSS_NMEA_GGA_MASK |
-						NRF_MODEM_GNSS_NMEA_GLL_MASK |
-						NRF_MODEM_GNSS_NMEA_GSA_MASK |
-						NRF_MODEM_GNSS_NMEA_GSV_MASK |
-						NRF_MODEM_GNSS_NMEA_RMC_MASK);
+	ret = nrf_modem_gnss_nmea_mask_set(NRF_MODEM_GNSS_NMEA_GSV_MASK);
 	if (ret < 0) {
 		LOG_ERR("Failed to set NMEA mask (%d).", ret);
 		return ret;
@@ -403,16 +411,24 @@ static void pgps_event_handler(struct nrf_cloud_pgps_event *event)
 
 #endif /* CONFIG_SLM_NRF_CLOUD */
 
-#if defined(CONFIG_SLM_LOG_LEVEL_DBG)
+#if defined(CONFIG_SLM_LOG_NMEA)
 static void on_gnss_evt_nmea(void)
 {
 	struct nrf_modem_gnss_nmea_data_frame nmea;
 
 	if (nrf_modem_gnss_read((void *)&nmea, sizeof(nmea), NRF_MODEM_GNSS_DATA_NMEA) == 0) {
-		LOG_DBG("%s", nmea.nmea_str);
+        LOG_DBG("%s", nmea.nmea_str);
+        /*
+         * Push received message to msgq
+         * The worker will push it to the host as a string
+         */
+        k_msgq_put(&log_queue_nmea, &nmea, K_NO_WAIT);
+        k_work_submit(&log_work);
 	}
 }
+#endif /* CONFIG_SLM_LOG_NMEA */
 
+#if defined(CONFIG_SLM_LOG_PVT)
 static void on_gnss_evt_pvt(void)
 {
 	struct nrf_modem_gnss_pvt_data_frame pvt;
@@ -432,8 +448,15 @@ static void on_gnss_evt_pvt(void)
 				(pvt.sv[i].flags & NRF_MODEM_GNSS_SV_FLAG_UNHEALTHY) ? 1 : 0);
 		}
 	}
+
+    /*
+     * Push received message to msgq
+     * The worker will push it to the host as a string
+     */
+    k_msgq_put(&log_queue_pvt, &pvt, K_NO_WAIT);
+    k_work_submit(&log_work);
 }
-#endif /* CONFIG_SLM_LOG_LEVEL_DBG */
+#endif /* CONFIG_SLM_LOG_PVT */
 
 #if defined(CONFIG_SLM_NRF_CLOUD)
 static int do_cloud_send_obj(struct nrf_cloud_obj *const obj)
@@ -545,6 +568,45 @@ static void fix_rep_wk(struct k_work *work)
 #endif /* CONFIG_SLM_NRF_CLOUD */
 }
 
+#if defined(CONFIG_SLM_LOG_NMEA) || defined(CONFIG_SLM_LOG_PVT)
+/* Worker used to push NMEA and PVT strings to host */
+static void log_worker(struct k_work *work)
+{
+#if defined(CONFIG_SLM_LOG_NMEA)
+    struct nrf_modem_gnss_nmea_data_frame nmea;
+
+    if (k_msgq_get(&log_queue_nmea, &nmea, K_MSEC(100)) == 0) {
+        LOG_INF("NMEA string from queue %s", nmea.nmea_str);
+        slm_uart_tx_write(nmea.nmea_str, strlen(nmea.nmea_str), false, false);
+    }
+#endif /* CONFIG_SLM_LOG_NMEA */
+
+#if defined(CONFIG_SLM_LOG_PVT)
+    struct nrf_modem_gnss_pvt_data_frame pvt;
+
+    if (k_msgq_get(&log_queue_pvt, &pvt, K_MSEC(100)) == 0) {
+        int offset = 0;
+        char log_str_pvt[1024];
+        for (int i = 0; i < NRF_MODEM_GNSS_MAX_SATELLITES; ++i) {
+            if (pvt.sv[i].sv) { /* SV number 0 indicates no satellite */
+                snprintf(&log_str_pvt[offset], sizeof(log_str_pvt) - offset, "PVT: SV:%3d sig: %d c/n0:%4d el:%3d az:%3d in-fix: %d unhealthy: %d\n",
+                         pvt.sv[i].sv, pvt.sv[i].signal, pvt.sv[i].cn0,
+                         pvt.sv[i].elevation, pvt.sv[i].azimuth,
+                         (pvt.sv[i].flags & NRF_MODEM_GNSS_SV_FLAG_USED_IN_FIX) ? 1 : 0,
+                         (pvt.sv[i].flags & NRF_MODEM_GNSS_SV_FLAG_UNHEALTHY) ? 1 : 0);
+                offset = strlen(log_str_pvt);
+            }
+        }
+
+        if (offset) {
+            memcpy(&log_str_pvt[offset], "\r\n\0", 3);
+            slm_uart_tx_write(log_str_pvt, strlen(log_str_pvt), false);
+        }
+    }
+#endif /* CONFIG_SLM_LOG_PVT */
+}
+#endif /* CONFIG_SLM_LOG_NMEA || CONFIG_SLM_LOG_PVT */
+
 static void on_gnss_evt_fix(void)
 {
 	if (gnss_ttff_start != 0) {
@@ -561,14 +623,16 @@ static void on_gnss_evt_fix(void)
 static void gnss_event_handler(int event)
 {
 	switch (event) {
-#if defined(CONFIG_SLM_LOG_LEVEL_DBG)
+#if defined(CONFIG_SLM_LOG_PVT)
 	case NRF_MODEM_GNSS_EVT_PVT:
 		on_gnss_evt_pvt();
 		break;
+#endif /* CONFIG_SLM_LOG_PVT */
+#if defined(CONFIG_SLM_LOG_NMEA)
 	case NRF_MODEM_GNSS_EVT_NMEA:
 		on_gnss_evt_nmea();
 		break;
-#endif
+#endif /* CONFIG_SLM_LOG_NMEA */
 	case NRF_MODEM_GNSS_EVT_FIX:
 		LOG_INF("GNSS_EVT_FIX");
 		on_gnss_evt_fix();
@@ -782,6 +846,10 @@ int slm_at_gnss_init(void)
 #endif
 #endif /* CONFIG_SLM_NRF_CLOUD */
 	k_work_init(&fix_rep, fix_rep_wk);
+
+#if defined(CONFIG_SLM_LOG_NMEA) || defined(CONFIG_SLM_LOG_PVT)
+    k_work_init(&log_work, log_worker);
+#endif /* CONFIG_SLM_LOG_NMEA || CONFIG_SLM_LOG_PVT */
 
 	return err;
 }

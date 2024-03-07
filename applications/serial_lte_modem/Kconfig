@@ -26,6 +26,12 @@ config SLM_AT_MAX_PARAM
 config SLM_NATIVE_TLS
 	bool "Use Zephyr mbedTLS"
 
+config SLM_LOG_NMEA
+	bool "Send NMEA strings to host"
+
+config SLM_LOG_PVT
+	bool "Send PVT strings to host"
+
 #
 # external XTAL for UART
 #

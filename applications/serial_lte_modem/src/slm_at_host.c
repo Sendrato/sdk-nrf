@@ -242,6 +242,10 @@ static size_t raw_rx_handler(const uint8_t *buf, const size_t len)
 			if (quit_str_match_count == strlen(slm_quit_str)) {
 				quit_str_match = true;
 			}
+		} else if (buf[processed] == slm_quit_str[0]) {
+			/* Match restart. Possible previous partial quit_str match is data. */
+			quit_str_match_count = 1;
+			prev_quit_str_match = false;
 		} else {
 			/* No match. Possible previous partial quit_str match is data. */
 			quit_str_match_count = 0;
