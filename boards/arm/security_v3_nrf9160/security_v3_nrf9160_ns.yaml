@@ -1,0 +1,13 @@
+identifier: security_v3_nrf9160_ns
+name: Security_v3-nRF9160-Non-Secure
+type: mcu
+arch: arm
+toolchain:
+  - gnuarmemb
+  - zephyr
+ram: 128
+flash: 256
+supported:
+  - gpio
+  - i2c
+  - netif:modem

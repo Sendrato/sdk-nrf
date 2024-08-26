@@ -1,0 +1,12 @@
+# Copyright (c) 2024, Sendrato.com
+# SPDX-License-Identifier: All rights reserved.
+
+if SOC_NRF9160_SICA
+
+config BOARD_SECURITY_V3_NRF9160
+	bool "nRF9160 Security v3"
+
+config BOARD_SECURITY_V3_NRF9160_NS
+	bool "nRF9160 Security v3 non-secure"
+
+endif # SOC_NRF9160_SICA
